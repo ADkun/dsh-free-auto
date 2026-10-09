@@ -1,6 +1,6 @@
 # dsh-free-auto — Auto-Free 自动路由 + 模型速切
 
-把 [dsh-our-free-model](../../plugins/dsh-our-free-model) 当前可用的免费模型**排好序**列出来，
+把 `dsh-our-free-model` 当前可用的免费模型**排好序**列出来，
 在会话页右下角放一个不显眼的悬浮按钮：点开列表、点模型名就切换当前会话的模型；
 列表最上方的 **Auto-Free** 则由插件替你自动挑（挑的就是列表第一名）。
 
