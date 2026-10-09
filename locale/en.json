@@ -1,0 +1,4 @@
+{
+  "title": "Auto-Free + model switcher",
+  "description": "Adds Auto-Free at the top of the list: it routes to the highest-ranked free model, locks that model for the whole session, re-scans the list and switches models automatically after a rate limit or an exhausted quota, and keeps subagents off the best model. The remaining models are ranked by availability, vision, first-token latency, context window and output ceiling; a floating button in the lower-right of the session page opens the list and clicking a model switches the current session to it."
+}

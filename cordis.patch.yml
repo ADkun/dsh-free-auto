@@ -1,0 +1,7 @@
+# Inserted by the dsh-free-auto bundle. The plugin registers the virtual
+# `free-auto` provider route and depends on the dsh-our-free-model bundle being
+# present in the same profile (it discovers its routes through ctx.llm).
+- insert:
+    - id: free-auto
+      name: dsh-free-auto
+      config: {}

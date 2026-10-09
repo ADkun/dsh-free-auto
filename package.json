@@ -1,0 +1,36 @@
+{
+  "name": "dsh-free-auto",
+  "version": "2.1.0",
+  "private": true,
+  "description": "Auto-Free routing (pick the top free model, lock it per session, switch on rate limit) plus a ranked list and a floating quick-switch panel for the free models dsh-our-free-model currently offers.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "Auto-Free + 模型速切",
+    "description": "Auto-Free 自动路由到列表第一名（会话内锁定，限流/额度用尽自动换模型续跑，子智能体避开最优模型）；同一份排好序的列表在会话页右下角悬浮按钮里，点一下即可切换当前会话的模型。"
+  }
+}
