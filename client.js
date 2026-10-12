@@ -12,6 +12,9 @@
  *      收在「展开已隐藏」下面，点开能看到不可用的原因；
  *   3. 「重新探测」按钮调用子插件自己的 POST /api/our-free-model/reprobe（同源请求
  *      能过它的准入检查），再隔几次打掉宿主缓存重读，结果是稳定的；
+ *   3b. 右边的「设置」按钮展开排序设置区：5 个排序字段逐个上移/下移、勾选启用与否，
+ *      或一键「恢复默认」；改动经 POST /api/free-auto/settings 落盘（
+ *      <DSH_HOME>/free-auto/settings.json）并立刻按新链重排列表，失败显示在标题处；
  *   4. 从会话的 modelSelection 投影读出当前模型（内置模型选择器改了也能跟上），
  *      点某个模型名时调用 DSH 自带的 Remote：ctx.remote.session.selectModel(...)
  *      —— 与内置选择器走的是同一条路径（写入会话的 "model/selection" 事件，
@@ -34,6 +37,8 @@ window.__ModuleLoader__.load({
 
     const LIST_URL = '/api/free-auto/models'
     const REFRESH_URL = '/api/free-auto/refresh'
+    /** 排序链（字段顺序 + 启用与否）的读写口，见面板里的「设置」。 */
+    const SETTINGS_URL = '/api/free-auto/settings'
     /** 子插件自己的接口：同源请求能过它的 trust fence（见宿主半身的说明）。 */
     const REPROBE_URL = '/api/our-free-model/reprobe'
     const POLL_MS = 60_000
@@ -105,6 +110,25 @@ window.__ModuleLoader__.load({
 }
 .fa-refresh:hover { background: var(--dsw-alias-bg-tertiary, rgba(255, 255, 255, 0.06)); }
 .fa-refresh:disabled { opacity: 0.55; cursor: default; }
+.fa-settings { opacity: 0.9; }
+/* 设置区在模型列表**上方**（头部那行之下、列表之前），所以分隔线落在下缘。 */
+.fa-set {
+  margin-bottom: 4px;
+  padding: 2px 4px 6px;
+  border-bottom: 1px solid var(--dsw-alias-border-secondary, rgba(255, 255, 255, 0.1));
+}
+.fa-set-head { display: flex; align-items: center; gap: 8px; padding: 0 4px 6px; }
+.fa-set-title { flex: 1; min-width: 0; color: var(--dsw-alias-text-primary, #f2f3f5); font-weight: 600; }
+.fa-set-row { display: flex; align-items: center; gap: 6px; padding: 3px 4px; }
+.fa-set-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fa-set-off .fa-set-label { opacity: 0.5; text-decoration: line-through; }
+.fa-set-hint { padding: 0 4px 4px 10px; font-size: 12px; opacity: 0.55; }
+.fa-set-move { flex: none; width: 22px; padding: 1px 0; border: 1px solid var(--dsw-alias-border-secondary, rgba(255, 255, 255, 0.14)); border-radius: 6px; background: transparent; color: inherit; font: inherit; font-size: 12px; line-height: 1.2; cursor: pointer; }
+.fa-set-move:hover { background: var(--dsw-alias-bg-tertiary, rgba(255, 255, 255, 0.06)); }
+.fa-set-move:disabled { opacity: 0.35; cursor: default; }
+.fa-set-check { flex: none; margin: 0; cursor: pointer; }
+.fa-set-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 4px 2px; font-size: 12px; }
+.fa-set-actions { display: flex; gap: 6px; }
 .fa-row {
   display: flex;
   align-items: center;
@@ -192,6 +216,57 @@ button.fa-row:hover { background: var(--dsw-alias-bg-tertiary, rgba(255, 255, 25
     }
     const stateLabel = (row) => STATE_LABELS[row?.state] ?? ''
 
+    /** 排序字段的显示名（宿主 GET /settings 的 catalog 里也各带一份 label，这里只是兜底）。 */
+    const SORT_LABELS = {
+      availability: '可用性',
+      multimodal: '多模态',
+      ttft: '首字延迟',
+      context: '上下文',
+      maxTokens: '输出上限',
+    }
+    const sortLabel = (field) => String(field?.label ?? SORT_LABELS[field?.key] ?? field?.key ?? '')
+    const DEFAULT_SORT_KEYS = ['availability', 'multimodal', 'ttft', 'context', 'maxTokens']
+    /** 默认排序链的说明文字（脚注在"当前就是默认链"时用它）。 */
+    const DEFAULT_SORT_TEXT = DEFAULT_SORT_KEYS.map((key) => SORT_LABELS[key]).join(' › ')
+
+    /**
+     * 脚注要说清"当前生效的排序链"：停用的字段用括号标出来，所以停了什么一眼能看出来。
+     * 全部停用就只剩链尾的 provider/model 定序（那是不可配置的，永远在）。
+     */
+    function sortChainText(fields) {
+      const list = Array.isArray(fields) ? fields : []
+      if (!list.length) return `按 ${DEFAULT_SORT_TEXT} 排序`
+      const parts = list.map((field) => (field?.enabled === false ? `(${sortLabel(field)}停用)` : sortLabel(field)))
+      return `按 ${parts.join(' › ')} 排序`
+    }
+
+    /** 设置区要列的行：宿主的 5 字段目录（带说明）与当前链（带顺序/开关）并起来。 */
+    function mergeSortFields(settings) {
+      const catalog = Array.isArray(settings?.catalog) && settings.catalog.length
+        ? settings.catalog
+        : DEFAULT_SORT_KEYS.map((key) => ({ key, label: SORT_LABELS[key] }))
+      const active = Array.isArray(settings?.fields) ? settings.fields : []
+      const enabled = new Map(active.map((field) => [String(field?.key ?? ''), field?.enabled !== false]))
+      const ordered = active.length ? active : catalog.map((field) => ({ key: field.key, enabled: true }))
+      return ordered.map((field) => {
+        const key = String(field?.key ?? '')
+        const meta = catalog.find((entry) => String(entry?.key ?? '') === key) ?? {}
+        return {
+          key,
+          label: sortLabel({ ...meta, key }),
+          hint: String(meta?.hint ?? ''),
+          enabled: enabled.has(key) ? enabled.get(key) : true,
+        }
+      })
+    }
+
+    /** 本机就是默认链（顺序一致 + 全启用）时返回 true。 */
+    function isDefaultSort(fields) {
+      const list = Array.isArray(fields) ? fields : []
+      if (list.length !== DEFAULT_SORT_KEYS.length) return false
+      return list.every((field, index) => String(field?.key ?? '') === DEFAULT_SORT_KEYS[index] && field?.enabled !== false)
+    }
+
     /** 一行的小字：可用性 · 模态 · 首 token 延迟 · 上下文 · 输出 · 探测时间 · 档位数。 */
     function metaLine(row) {
       const parts = []
@@ -265,6 +340,9 @@ button.fa-row:hover { background: var(--dsw-alias-bg-tertiary, rgba(255, 255, 25
       const [probing, setProbing] = useState(false)
       const [showHidden, setShowHidden] = useState(false)
       const [error, setError] = useState('')
+      const [settings, setSettings] = useState(null)
+      const [showSettings, setShowSettings] = useState(false)
+      const [saving, setSaving] = useState(false)
       const rootRef = useRef(null)
       const leaveTimer = useRef(null)
       const aliveRef = useRef(true)
@@ -421,6 +499,89 @@ button.fa-row:hover { background: var(--dsw-alias-bg-tertiary, rgba(255, 255, 25
 
       const models = Array.isArray(snapshot?.models) ? snapshot.models : []
       const hiddenModels = Array.isArray(snapshot?.hiddenModels) ? snapshot.hiddenModels : []
+
+      /**
+       * 排序设置的读写。POST `{fields:[…]}` 改序/停用，POST `{reset:true}` 恢复默认；
+       * 宿主落盘后立刻按新链重排并返回列表，但那份载荷不含本会话的 Auto-Free 选举
+       * （`auto` 只在读列表时按 sessionId 报回来），所以落盘成功后再拉一次列表，
+       * 保证模型顺序、Auto-Free 行、当前标记都是最新的。
+       * 失败（含宿主的 500 + 错误文本）显式报错，不静默。
+       */
+      const postSettings = useCallback(
+        async (body) => {
+          if (saving) return
+          setSaving(true)
+          setError('')
+          try {
+            const response = await fetch(SETTINGS_URL, {
+              method: 'POST',
+              cache: 'no-store',
+              headers: { accept: 'application/json', 'content-type': 'application/json' },
+              body: JSON.stringify(body),
+            })
+            const text = await response.text()
+            if (!response.ok) throw new Error(text || `保存排序设置失败：HTTP ${response.status}`)
+            const data = JSON.parse(text)
+            if (aliveRef.current) {
+              setSettings(data.settings ?? null)
+              setSnapshot(data)
+            }
+            await load().catch(() => {})
+            return data
+          } catch (failure) {
+            if (aliveRef.current) setError(String(failure?.message ?? failure))
+            return null
+          } finally {
+            if (aliveRef.current) setSaving(false)
+          }
+        },
+        [load, saving],
+      )
+
+      /** 打开设置区：先读一次宿主当前的排序链（同时补上 catalog/默认链）。 */
+      const openSettings = useCallback(async () => {
+        if (showSettings) {
+          setShowSettings(false)
+          return
+        }
+        setShowSettings(true)
+        try {
+          const response = await fetch(SETTINGS_URL, { cache: 'no-store', headers: { accept: 'application/json' } })
+          if (!response.ok) throw new Error(`读取排序设置失败：HTTP ${response.status}`)
+          const data = await response.json()
+          if (aliveRef.current) {
+            setSettings(data)
+            setError('')
+          }
+        } catch (failure) {
+          if (aliveRef.current) setError(String(failure?.message ?? failure))
+        }
+      }, [showSettings])
+
+      const sortRows = mergeSortFields(settings)
+      /** 上移/下移：整条链重新落盘（顺序就是排序链本身）。 */
+      const moveField = useCallback(
+        (index, delta) => {
+          const next = sortRows.slice()
+          const to = index + delta
+          if (to < 0 || to >= next.length) return
+          const moved = next[index]
+          next[index] = next[to]
+          next[to] = moved
+          void postSettings({ fields: next.map(({ key, enabled }) => ({ key, enabled })) })
+        },
+        [postSettings, sortRows],
+      )
+      const toggleField = useCallback(
+        (index, enabled) => {
+          const next = sortRows.map((field, at) => (at === index ? { ...field, enabled } : field))
+          void postSettings({ fields: next.map((field) => ({ key: field.key, enabled: field.enabled })) })
+        },
+        [postSettings, sortRows],
+      )
+      const resetFields = useCallback(() => {
+        void postSettings({ reset: true })
+      }, [postSettings])
       // Auto-Free 永远排在第一位：选中它以后由宿主自动路由到列表最上方的模型。
       const auto = snapshot?.auto
       const autoRow =
@@ -454,6 +615,12 @@ button.fa-row:hover { background: var(--dsw-alias-bg-tertiary, rgba(255, 255, 25
           ? '切换中…'
           : '选择模型'
       const foldedStates = Array.from(new Set(hiddenModels.map((row) => stateLabel(row)).filter(Boolean)))
+      // 脚注反映的是"当前生效的排序链"：列表载荷里就带着它（POST settings 之后也是）。
+      const activeSortFields = Array.isArray(snapshot?.sortFields)
+        ? snapshot.sortFields
+        : Array.isArray(settings?.fields)
+          ? settings.fields
+          : []
 
       return h(
         'div',
@@ -488,7 +655,97 @@ button.fa-row:hover { background: var(--dsw-alias-bg-tertiary, rgba(255, 255, 25
                 },
                 probing ? '探测中…' : '重新探测',
               ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'fa-refresh fa-settings',
+                  'aria-expanded': showSettings,
+                  title: '自定义模型排序字段（顺序 + 启用/停用），可一键恢复默认',
+                  onClick: () => void openSettings(),
+                },
+                '设置',
+              ),
             ),
+            showSettings &&
+              h(
+                'div',
+                { className: 'fa-set' },
+                h(
+                  'div',
+                  { className: 'fa-set-head' },
+                  h('span', { className: 'fa-set-title' }, '排序字段'),
+                  h('span', {}, saving ? '保存中…' : isDefaultSort(sortRows) ? '默认' : '自定义'),
+                ),
+                sortRows.map((field, index) =>
+                  h(
+                    'div',
+                    { key: field.key, className: `fa-set-row${field.enabled ? '' : ' fa-set-off'}` },
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'fa-set-move',
+                        disabled: index === 0 || saving,
+                        title: '上移一位（越靠前越优先）',
+                        onClick: () => moveField(index, -1),
+                      },
+                      '↑',
+                    ),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'fa-set-move',
+                        disabled: index === sortRows.length - 1 || saving,
+                        title: '下移一位',
+                        onClick: () => moveField(index, 1),
+                      },
+                      '↓',
+                    ),
+                    h('span', { className: 'fa-set-label' }, `${index + 1}. ${field.label}`),
+                    h('input', {
+                      type: 'checkbox',
+                      className: 'fa-set-check',
+                      checked: field.enabled,
+                      disabled: saving,
+                      'aria-label': `启用 ${field.label}`,
+                      title: field.hint || `启用 ${field.label}`,
+                      onChange: (event) => toggleField(index, event.target.checked),
+                    }),
+                  ),
+                ),
+                h(
+                  'div',
+                  { className: 'fa-set-hint' },
+                  '越靠前的字段越优先；停用的字段不参与排序。链尾始终按 provider/model 名字定序，保证列表稳定。改完只影响新会话的选举——已经选举过的会话仍用它锁定的模型。',
+                ),
+                h(
+                  'div',
+                  { className: 'fa-set-foot' },
+                  h('span', {}, `默认：${DEFAULT_SORT_TEXT}`),
+                  h(
+                    'span',
+                    { className: 'fa-set-actions' },
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'fa-refresh',
+                        disabled: saving,
+                        title: '恢复默认顺序并全部启用',
+                        onClick: () => resetFields(),
+                      },
+                      '恢复默认',
+                    ),
+                    h(
+                      'button',
+                      { type: 'button', className: 'fa-refresh', onClick: () => setShowSettings(false) },
+                      '收起',
+                    ),
+                  ),
+                ),
+              ),
             visible.map((row) => {
               const active = samePick(row, effective)
               const switching = busy === rowKey(row)
@@ -558,7 +815,7 @@ button.fa-row:hover { background: var(--dsw-alias-bg-tertiary, rgba(255, 255, 25
             h(
               'div',
               { className: 'fa-foot' },
-              `Auto-Free = 自动用最上方的模型 · 按 可用 › 多模态 › 首字延迟 › 上下文 › 输出上限 排序${
+              `Auto-Free = 自动用最上方的模型 · ${sortChainText(activeSortFields)}${
                 Array.isArray(snapshot?.hideStates) && snapshot.hideStates.length
                   ? ` · 折叠 ${snapshot.hideStates.map((state) => STATE_LABELS[state] ?? state).join('/')}`
                   : ''

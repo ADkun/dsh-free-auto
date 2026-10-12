@@ -20,13 +20,16 @@
  * 用临时 DSH_HOME 写 availability.json / stats.json，因此排名与可用性是确定的。
  */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as plugin from '../index.js'
 
 const DSH_HOME = mkdtempSync(join(tmpdir(), 'free-auto-router-'))
 process.env.DSH_HOME = DSH_HOME
+
+/** 跑完（含断言失败退出）都回收临时 HOME，别在 %TEMP% 里堆 free-auto-router-*。 */
+process.on('exit', () => rmSync(DSH_HOME, { recursive: true, force: true }))
 
 const ROUTE = 'free-auto'
 const AUTO_MODEL = 'auto-free'
@@ -151,6 +154,16 @@ function makeCtx({ config = {}, script, selection, subagents = [] } = {}) {
       cb({ webServer: { register: (route) => (routes.push(route), () => {}) }, effect })
     },
   }
+
+  // 真机语义：这个 profile 里**没有 fs 服务**，真 fiber 里 `ctx.fs` 会抛
+  // `cannot get property "fs" without inject`——插件在 apply / 构造期读它就等于启动即崩。
+  Object.defineProperty(ctx, 'fs', {
+    configurable: true,
+    get() {
+      throw new Error('cannot get property "fs" without inject')
+    },
+  })
+  ctx.reflect = { get: () => undefined }
 
   reset()
   plugin.apply(ctx, config)
@@ -483,6 +496,106 @@ const ask = (sessionId) => ({ provider: ROUTE, model: AUTO_MODEL, messages: [], 
   const refresh = world.routes.find((route) => route.path === '/api/free-auto/refresh')
   assert.ok(refresh, 'the refresh route exists for the client')
   console.log('12 the HTTP payload advertises the Auto-Free row and the election')
+}
+
+// --- 13 --------------------------------------------------------------------
+{
+  // README 的既有承诺：Auto-Free = 列表第一名。改序之后这条必须继续成立。
+  // 限定词很重要：只对**尚未选举过**的会话成立——已选举的会话按既有承诺锁定旧模型
+  // （会话内锁定在 §3 里单独守着）。
+  // 宿主半身按真实请求流读体（for await），所以这里给一个异步可迭代对象。
+  const send = (route, method, body, url = '/api/free-auto/models') => {
+    const res = { status: 0, headers: null, body: undefined, writeHead(code, headers) { this.status = code; this.headers = headers }, end(chunk) { this.body = chunk } }
+    const req = {
+      method,
+      url,
+      async *[Symbol.asyncIterator]() {
+        if (body) yield body
+      },
+    }
+    return route.handler(req, res).then(() => res)
+  }
+  const fields = (keys) => keys.map((key) => ({ key, enabled: true }))
+
+  // 本样本里 m-best 在每个字段上都赢（可用性/多模态/首字/上下文/输出上限全都第一），
+  // 光换顺序不可能换头。所以这里把目录里本来就有的 m-new（视觉 + 2M 上下文 +
+  // 65536 输出上限，但首字慢一点）也放进列表，它才让"改序换头"变得可观察。
+  LIST = ['m-best', 'm-mid', 'm-slow', 'm-raw', 'm-new']
+  const world = makeCtx()
+  const free = world.services.get('free-auto')
+  await free.refresh()
+  // m-new 首字 3000ms：默认链（多模态 → 首字）下 m-best(1000ms) 仍然第一。
+  writeAvailability({ 'm-best': probed(1000), 'm-mid': probed(2000), 'm-slow': probed(9000), 'm-new': probed(3000), 'm-raw': raw() })
+  await free.refresh()
+  const before = free.models()
+  assert.deepEqual(
+    before.models.map((row) => row.model),
+    ['m-best', 'm-new', 'm-mid', 'm-slow', 'm-raw'],
+    'default chain: vision first, then the fastest first token',
+  )
+  assert.equal(before.models[0].model, 'm-best')
+
+  const settings = world.routes.find((route) => route.path === '/api/free-auto/settings')
+  assert.ok(settings, 'the settings route is registered next to the others')
+  const models = world.routes.find((route) => route.path === '/api/free-auto/models')
+
+  // 「输出上限」提到最前：m-new 的 65536 顶上来，第一名从 m-best 换成 m-new。
+  const posted = await send(settings, 'POST', JSON.stringify({ fields: fields(['maxTokens', 'availability', 'multimodal', 'ttft', 'context']) }))
+  assert.equal(posted.status, 200)
+  const swapped = free.models()
+  assert.deepEqual(
+    swapped.models.map((row) => row.model),
+    ['m-new', 'm-best', 'm-mid', 'm-slow', 'm-raw'],
+    'maxTokens-first really re-orders the list',
+  )
+  assert.deepEqual(swapped.models.map((row) => row.model), JSON.parse(posted.body).models.map((row) => row.model), 'POST and the live list agree')
+  assert.equal(swapped.models[0].model, 'm-new', 'the new head is the model with the largest output ceiling')
+  await collect(world.adapter().stream(ask('s-elec')))
+  assert.equal(
+    world.calls.streams[0].model,
+    swapped.models[0].model,
+    'after re-ordering, Auto-Free still elects the new list head',
+  )
+  assert.notEqual(swapped.models[0].model, before.models[0].model, 'the new head really differs from the old one')
+  const payload = await send(models, 'GET', undefined, '/api/free-auto/models?sessionId=s-elec')
+  assert.equal(JSON.parse(payload.body).auto.elected.model, swapped.models[0].model, 'and the HTTP payload says so too')
+
+  // 停用一个字段必须真的把它踢出比较（而不是只把它挪个位置）：同一组顺序里
+  // maxTokens 领跑时 head 是 m-new；把它停掉，head 必须换回 m-best。
+  const off = fields(['maxTokens', 'availability', 'multimodal', 'ttft', 'context']).map((field) =>
+    field.key === 'maxTokens' ? { ...field, enabled: false } : field,
+  )
+  const disabled = await send(settings, 'POST', JSON.stringify({ fields: off }))
+  assert.equal(disabled.status, 200)
+  const retired = free.models()
+  assert.equal(
+    retired.models[0].model,
+    'm-best',
+    'disabling the leading field hands the head back (ignoring `enabled` would keep m-new first)',
+  )
+  assert.deepEqual(
+    retired.models.map((row) => row.model),
+    before.models.map((row) => row.model),
+    'and the list it produces equals the default-chain list',
+  )
+  assert.deepEqual(
+    JSON.parse(disabled.body).sortFields.map((field) => [field.key, field.enabled]),
+    [['maxTokens', false], ['availability', true], ['multimodal', true], ['ttft', true], ['context', true]],
+    'the disabled flag survives the round trip',
+  )
+
+  // {reset:true} 之后第一名回到改动前那一个。
+  const reset = await send(settings, 'POST', JSON.stringify({ reset: true }))
+  assert.equal(reset.status, 200)
+  await collect(world.adapter().stream(ask('s-reset')))
+  assert.equal(world.calls.streams[1].model, 'm-best', 'reset puts the original winner back on top')
+  assert.deepEqual(
+    free.models().models.map((row) => row.model),
+    before.models.map((row) => row.model),
+    'reset reproduces the pre-settings list row for row',
+  )
+  LIST = ['m-best', 'm-mid', 'm-slow', 'm-raw']
+  console.log('13 for a session that has not elected yet, the elected model always equals the top of the list, before and after re-ordering')
 }
 
 console.log('dsh-free-auto: all router assertions passed')
